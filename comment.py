@@ -25,7 +25,7 @@ EXCLUDED_USERS = [u.lstrip("!") for u in RAW_USERS if u.startswith("!")]
 TARGET_TEAMS = [t.strip() for t in os.getenv("TARGET_TEAMS", "").split(",") if t.strip()]
 
 MEETING_ISSUE_KEY = os.getenv("MEETING_ISSUE_KEY", "LIFE-5")
-MEETING_ACCOUNT_KEY = os.getenv("MEETING_ACCOUNT_KEY", "io-14")
+MEETING_ACCOUNT_KEY = os.getenv("MEETING_ACCOUNT_KEY", "lo-14")
 MONDAY_EXCLUDE_USERS = [u.strip() for u in os.getenv("MONDAY_EXCLUDE_USERS", "").split(",") if u.strip()]
 
 TARGET_PROJECTS = os.getenv("TARGET_PROJECTS", "")
@@ -74,11 +74,29 @@ def parse_time_to_seconds(time_str):
     total_seconds = (hours * 3600) + (minutes * 60)
     return total_seconds if total_seconds > 0 else None
 
-def process_comment_body(raw_body, default_product):
-    """Извлекает теги продукта и времени из первых двух строк комментария, если они есть."""
+def process_comment_body(raw_body, default_product, project_key):
+    """Извлекает теги продукта и времени из комментария."""
     lines = raw_body.strip().split('\n')
     non_empty_lines = [line.strip() for line in lines if line.strip()]
     
+    # 1. ПРОВЕРКА: Пользователь написал только время в первой строке
+    if non_empty_lines:
+        time_only = parse_time_to_seconds(non_empty_lines[0])
+        if time_only:
+            cut_idx = 0
+            for i, line in enumerate(lines):
+                if line.strip():
+                    cut_idx = i + 1
+                    break
+            clean_body = '\n'.join(lines[cut_idx:]).strip()
+            if not clean_body:
+                clean_body = "Ворклог"
+                
+            prod = None if project_key == "INT" else default_product
+            print(f"🎯 УСПЕШНО: Найдено только время: {time_only} сек. Продукт опущен.")
+            return prod, time_only, clean_body
+
+    # 2. ПРОВЕРКА: Стандартный поиск Продукт + Время
     if len(non_empty_lines) >= 2:
         potential_product = non_empty_lines[0]
         potential_time = non_empty_lines[1]
@@ -119,6 +137,10 @@ def process_comment_body(raw_body, default_product):
         else:
             print(f"⚠️ ТЕГИ ОТКЛОНЕНЫ: Строка '{potential_product}' не найдена ни в словаре, ни в ключах.")
             
+    # 3. ЕСЛИ ТЕГОВ НЕТ: применяем дефолтные правила
+    if project_key == "INT":
+        return None, DEFAULT_TIME_SPENT, raw_body.strip()
+        
     return default_product, DEFAULT_TIME_SPENT, raw_body.strip()
 
 def parse_jira_date(date_str):
@@ -204,19 +226,22 @@ def get_team_members():
             
             for m in members_data:
                 member_name = m.get("member", {}).get("name")
-                if not member_name: continue
+                if not member_name: 
+                    continue
                     
                 membership = m.get("membership", {})
                 raw_from = membership.get("dateFromANSI") or membership.get("dateFrom") or m.get("dateFrom")
                 raw_to = membership.get("dateToANSI") or membership.get("dateTo") or m.get("dateTo")
                 
                 start_dt = parse_jira_date(raw_from) if raw_from else datetime.min
-                if not start_dt: start_dt = datetime.min
+                if not start_dt: 
+                    start_dt = datetime.min
                     
                 end_dt_parsed = parse_jira_date(raw_to) if raw_to else None
                 end_dt = end_dt_parsed.replace(hour=23, minute=59, second=59) if end_dt_parsed else datetime.max
                 
-                if member_name not in team_users: team_users[member_name] = []
+                if member_name not in team_users: 
+                    team_users[member_name] = []
                 team_users[member_name].append((start_dt, end_dt))
                 
                 if start_dt <= now <= end_dt:
@@ -239,10 +264,12 @@ def get_team_members():
     return team_users
 
 def is_valid_author(author, comment_time, team_users):
-    if author in TARGET_USERS: return True
+    if author in TARGET_USERS: 
+        return True
     if author in team_users:
         for start_dt, end_dt in team_users[author]:
-            if start_dt <= comment_time <= end_dt: return True
+            if start_dt <= comment_time <= end_dt: 
+                return True
     return False
 
 def get_recent_jira_comments(team_users):
@@ -296,15 +323,19 @@ def get_recent_jira_comments(team_users):
             author_name = comment["author"].get("name")
             author_key = comment["author"].get("key") 
             
-            if not author_name: author_name = author_key or "Unknown"
-            if not author_key: author_key = author_name
+            if not author_name: 
+                author_name = author_key or "Unknown"
+            if not author_key: 
+                author_key = author_name
                 
             created_str = comment["created"][:19] 
             created_time = datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%S")
+            comment_id = comment.get("id") 
             
             if created_time > cutoff_time and is_valid_author(author_name, created_time, team_users):
-                print(f"[LOG] Найдена цель: {author_name} ({author_key}) оставил комментарий в {issue_key}")
+                print(f"[LOG] Найдена цель: {author_name} оставил комментарий (CID:{comment_id}) в {issue_key}")
                 recent_comments.append({
+                    "comment_id": comment_id,
                     "issue_key": issue_key,
                     "issue_id": issue_id,
                     "project_key": project_key,
@@ -317,94 +348,154 @@ def get_recent_jira_comments(team_users):
                 
     return recent_comments
 
-def worklog_exists(comment_data, date_str):
-    issue_key = comment_data['issue_key']
-    url = f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog"
+def filter_and_group_comments(comments):
+    """Отфильтровывает уже обработанные комментарии и склеивает оставшиеся."""
+    issue_worklogs = {}
     
-    response = requests.get(url, headers=JIRA_HEADERS)
-    if response.status_code != 200: return False
-        
-    worklogs = response.json().get("worklogs", [])
-    
-    for wl in worklogs:
-        description = str(wl.get("comment", ""))
-        start_date = wl.get("started", "")[:10] 
-        
-        wl_author = wl.get("author", {})
-        wl_author_key = wl_author.get("key", "")
-        wl_author_name = wl_author.get("name", "")
-        
-        is_same_author = (comment_data['author_key'] in (wl_author_key, wl_author_name)) or \
-                         (comment_data['author_name'] in (wl_author_key, wl_author_name))
-        
-        if start_date == date_str and AUTO_TAG in description and is_same_author:
-            return True
+    # Загружаем базу существующих ворклогов для проверки
+    for c in comments:
+        issue_key = c['issue_key']
+        if issue_key not in issue_worklogs:
+            url = f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog"
+            resp = requests.get(url, headers=JIRA_HEADERS)
+            if resp.status_code == 200:
+                issue_worklogs[issue_key] = resp.json().get("worklogs", [])
+            else:
+                issue_worklogs[issue_key] = []
             
-    return False
-
-def create_tempo_worklog(comment_data):
-    """Создает ворклог и возвращает кортеж (статус, сообщение)"""
-    date_str = comment_data['created'].strftime("%Y-%m-%d")
+    unprocessed = []
     
-    if worklog_exists(comment_data, date_str):
-        print(f"🤔 Ворклог для {comment_data['author_name']} в {comment_data['issue_key']} за {date_str} уже существует. Пропускаем.")
-        return "skipped", None
+    for c in comments:
+        comment_id = str(c['comment_id'])
+        marker = f"CID:{comment_id}"
+        is_processed = False
+        date_str = c['created'].strftime("%Y-%m-%d")
+        
+        for wl in issue_worklogs[c['issue_key']]:
+            desc = str(wl.get("comment", ""))
+            start_date = wl.get("started", "")[:10]
+            
+            # Проверка 1: Строго по ID комментария (надежно)
+            if marker in desc:
+                is_processed = True
+                break
+                
+            # Проверка 2: Обратная совместимость (если ворклог был создан до введения CID)
+            if start_date == date_str and AUTO_TAG in desc and "CID:" not in desc:
+                if c['body'][:30].strip() in desc:
+                    is_processed = True
+                    break
+                
+        if not is_processed:
+            # Парсим продукт ПЕРЕД группировкой, чтобы знать, склеивать их или нет
+            final_product, final_time, clean_body = process_comment_body(
+                c['body'], c.get('product_name'), c.get('project_key')
+            )
+            c['final_product'] = final_product
+            c['final_time'] = final_time
+            c['clean_body'] = clean_body
+            c['date_str'] = date_str
+            unprocessed.append(c)
+        else:
+            print(f"🤔 Комментарий CID:{comment_id} в {c['issue_key']} уже обработан. Пропускаем.")
+            
+    grouped = {}
+    for c in unprocessed:
+        # Уникальный ключ группы. Если продукты разные - комментарии склеены не будут!
+        group_key = (c['issue_key'], c['author_key'], c['date_str'], c['final_product'])
+        
+        if group_key not in grouped:
+            grouped[group_key] = {
+                'issue_key': c['issue_key'],
+                'issue_id': c['issue_id'],
+                'project_key': c['project_key'],
+                'author_name': c['author_name'],
+                'author_key': c['author_key'],
+                'created': c['created'],
+                'final_product': c['final_product'],
+                'total_time': 0,
+                'bodies': [],
+                'comment_ids': []
+            }
+        grouped[group_key]['total_time'] += c['final_time']
+        grouped[group_key]['bodies'].append(c['clean_body'])
+        grouped[group_key]['comment_ids'].append(str(c['comment_id']))
+        
+    return list(grouped.values())
 
-    final_product, final_time_spent, final_body = process_comment_body(
-        comment_data['body'], 
-        comment_data.get('product_name')
-    )
+def create_tempo_worklog(agg_data):
+    """Создает ворклог на основе сгруппированных данных."""
+    cids_str = ",".join(agg_data['comment_ids'])
+    
+    # Отдельная защита от дублей для авто-встреч
+    if 'MEET-' in cids_str:
+        issue_key = agg_data['issue_key']
+        resp = requests.get(f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog", headers=JIRA_HEADERS)
+        if resp.status_code == 200:
+            for wl in resp.json().get("worklogs", []):
+                if cids_str in str(wl.get("comment", "")):
+                    print(f"🤔 Ворклог для встречи ({cids_str}) пользователя {agg_data['author_name']} уже существует. Пропускаем.")
+                    return "skipped", None
 
-    if len(final_body) > 250:
-        final_body = final_body[:250] + "..."
-
-    description = f"{AUTO_TAG}\n{final_body}"
-    started_str = comment_data['created'].strftime("%Y-%m-%dT%H:%M:%S.000")
+    final_product = agg_data['final_product']
+    total_time_spent = agg_data['total_time']
+    
+    # Формируем тело с границами между разными комментариями
+    combined_body = "\n---\n".join(agg_data['bodies'])
+    if len(combined_body) > 250:
+        combined_body = combined_body[:250] + "..."
+        
+    # НОВОЕ: Перенесли CID в самый конец, чтобы он не засорял интерфейс
+    description = f"{AUTO_TAG} {combined_body}\n\n(CID:{cids_str})"
+    started_str = agg_data['created'].strftime("%Y-%m-%dT%H:%M:%S.000")
     
     payload = {
-        "originTaskId": comment_data['issue_id'], 
-        "worker": comment_data['author_key'], 
+        "originTaskId": agg_data['issue_id'], 
+        "worker": agg_data['author_key'], 
         "started": started_str,
-        "timeSpentSeconds": final_time_spent,
+        "timeSpentSeconds": total_time_spent,
         "comment": description
     }
     
     account_key = None
-    if comment_data.get("project_key") == "PRESALE" and final_product:
+    
+    if final_product: 
         account_key = PRODUCT_ACCOUNT_MAP.get(final_product) 
-        if account_key:
-            payload["attributes"] = {
-                "_Проект_": {
-                    "name": "Проект",
-                    "value": account_key
-                }
+        
+    # Если аккаунт не найден, а задача в INT — ставим MEETING_ACCOUNT_KEY
+    if not account_key and agg_data.get("project_key") == "INT": 
+        account_key = MEETING_ACCOUNT_KEY
+        
+    if account_key:
+        payload["attributes"] = {
+            "_Проект_": {
+                "name": "Проект", 
+                "value": account_key
             }
+        }
 
-    print("\n--- Планируемые изменения ---")
-    print(f"Задача: {comment_data['issue_key']} (ID: {comment_data['issue_id']})")
-    print(f"Пользователь (UserKey): {comment_data['author_key']}")
-    print(f"Дата и время: {started_str}")
-    print(f"Затрачено времени (сек): {final_time_spent} ({round(final_time_spent/60, 1)} мин)")
-    print("-----------------------------\n")
-
+    print(f"\n--- Планируемые изменения (Склеено комментариев: {len(agg_data['comment_ids'])}) ---")
+    print(f"Задача: {agg_data['issue_key']} | Аккаунт: {account_key or 'Нет'} | CID: {cids_str}")
+    print(f"Пользователь: {agg_data['author_name']} | Суммарное время: {round(total_time_spent/60, 1)} мин")
+    print("---------------------------------------------------\n")
+    
     if DEBUG_MODE:
-        return "success", f"{comment_data['author_name']} -> {comment_data['issue_key']} ({round(final_time_spent/60)}м) [DEBUG]"
+        return "success", f"{agg_data['author_name']} -> {agg_data['issue_key']} ({round(total_time_spent/60)}м) [DEBUG]"
 
-    tempo_url = f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs"
-    response = requests.post(tempo_url, headers=TEMPO_HEADERS, json=payload)
+    response = requests.post(f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs", headers=TEMPO_HEADERS, json=payload)
     
     if response.status_code in (200, 201):
-        print(f"✅ Ворклог успешно создан для {comment_data['author_name']} в {comment_data['issue_key']}")
-        return "success", f"{comment_data['author_name']} -> {comment_data['issue_key']} ({round(final_time_spent/60)}м)"
+        print(f"✅ Ворклог успешно создан!")
+        return "success", f"{agg_data['author_name']} -> {agg_data['issue_key']} ({round(total_time_spent/60)}м)"
     else:
-        print(f"🚫 Ошибка создания ворклога: {response.status_code} - {response.text}")
+        print(f"🚫 Ошибка создания ворклога: {response.text}")
         return "error", None
-        
+
 def send_mattermost_report(mode, success_list, skipped, errors):
     """Отправляет красивый сводный отчет в Mattermost."""
     if not MATTERMOST_WEBHOOK_URL:
         return
-
+        
     if not success_list and skipped == 0 and errors == 0:
         return
 
@@ -418,24 +509,23 @@ def send_mattermost_report(mode, success_list, skipped, errors):
     lines.append(f"⏩ **Пропущено (уже есть / лимиты):** {skipped}")
     lines.append(f"🚫 **Ошибок API:** {errors}")
 
-    if success_list:
+    if success_list: 
         lines.append("\n**Детализация списаний:**")
         for item in success_list:
             lines.append(f"• {item}")
-
+        
     payload = {"text": "\n".join(lines)}
-
-    if MATTERMOST_DEFAULT_CHANNEL:
+    
+    if MATTERMOST_DEFAULT_CHANNEL: 
         payload["channel"] = MATTERMOST_DEFAULT_CHANNEL
-    if MATTERMOST_USERNAME:
+        
+    if MATTERMOST_USERNAME: 
         payload["username"] = MATTERMOST_USERNAME
-
-    try:
-        response = requests.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"🚫 Ошибка отправки в Mattermost: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"🚫 Ошибка соединения с Mattermost: {e}")
+        
+    try: 
+        requests.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e: 
+        print(f"🚫 Ошибка Mattermost: {e}")
 
 def check_user_daily_hours(worker_key, date_str):
     """Считает общую сумму залогированных часов за день."""
@@ -450,14 +540,13 @@ def check_user_daily_hours(worker_key, date_str):
 def process_daily_meetings():
     print("\n--- ЗАПУСК АВТОМАТИЗАЦИИ ЕЖЕДНЕВНЫХ ВСТРЕЧ ---")
     
-    # 1. Получаем реальный ID задачи для встреч (Tempo требует числовой ID)
     meeting_issue_id = "UNKNOWN"
     res = requests.get(f"{JIRA_BASE_URL}/rest/api/2/issue/{MEETING_ISSUE_KEY}?fields=id", headers=JIRA_HEADERS)
-    if res.status_code == 200:
+    if res.status_code == 200: 
         meeting_issue_id = res.json().get("id")
-    else:
-        print(f"🚫 Ошибка: не удалось получить числовой ID для задачи {MEETING_ISSUE_KEY}. Проверьте доступность задачи.")
-        return
+    else: 
+        print("🚫 Ошибка: не удалось получить ID задачи для встреч.")
+        return 
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     is_monday = datetime.now().weekday() == 0
@@ -477,32 +566,35 @@ def process_daily_meetings():
             
         if is_monday:
             if user in MONDAY_EXCLUDE_USERS:
-                print(f"⏩ Пропускаем {user}: исключен из встреч по понедельникам.")
                 stats["skipped"] += 1
                 continue
                 
             total_hours_today = check_user_daily_hours(user, today_str)
             if total_hours_today >= 28800:
-                print(f"⏩ Пропускаем {user}: уже залогировано 8+ часов за понедельник.")
                 stats["skipped"] += 1
                 continue
 
-        fake_comment_data = {
+        # Создаем фейковые сгруппированные данные для совместимости с новой функцией
+        fake_agg_data = {
+            'comment_ids': [f"MEET-{today_str}"], 
             'issue_key': MEETING_ISSUE_KEY,
             'issue_id': meeting_issue_id, 
+            'project_key': 'LIFE',
             'author_key': user,
             'author_name': user,
             'created': datetime.now(),
-            'body': f"{MEETING_ACCOUNT_KEY}\n30m\nВстреча внутренняя",
-            'product_name': MEETING_ACCOUNT_KEY
+            'final_product': MEETING_ACCOUNT_KEY,
+            'total_time': 1800, # 30 минут
+            'bodies': ["Встреча внутренняя"]
         }
         
-        status, msg = create_tempo_worklog(fake_comment_data)
-        if status == "success":
+        status, msg = create_tempo_worklog(fake_agg_data)
+        
+        if status == "success": 
             stats["success"].append(msg)
-        elif status == "skipped":
+        elif status == "skipped": 
             stats["skipped"] += 1
-        elif status == "error":
+        elif status == "error": 
             stats["errors"] += 1
 
     send_mattermost_report("meetings", stats["success"], stats["skipped"], stats["errors"])
@@ -512,24 +604,33 @@ def main():
         process_daily_meetings()
     else:
         print(f"\nЗапуск проверки комментариев... (DEBUG_MODE: {DEBUG_MODE})")
+        
         team_users = get_team_members()
         comments = get_recent_jira_comments(team_users)
         
-        if not comments:
+        if not comments: 
             print("\nНовых комментариев не найдено.")
-            return
-
-        print(f"\nВсего найдено новых комментариев: {len(comments)}. Начинаем обработку...")
+            return 
+        
+        # Запускаем фильтрацию и склейку
+        aggregated_tasks = filter_and_group_comments(comments)
+        
+        if not aggregated_tasks:
+            print("Все найденные комментарии уже обработаны ранее.")
+            return 
+            
+        print(f"\nК созданию подготовлено ворклогов (после склейки): {len(aggregated_tasks)}. Начинаем обработку...")
         
         stats = {"success": [], "skipped": 0, "errors": 0}
         
-        for comment in comments:
-            status, msg = create_tempo_worklog(comment)
-            if status == "success":
+        for agg_data in aggregated_tasks:
+            status, msg = create_tempo_worklog(agg_data)
+            
+            if status == "success": 
                 stats["success"].append(msg)
-            elif status == "skipped":
+            elif status == "skipped": 
                 stats["skipped"] += 1
-            elif status == "error":
+            elif status == "error": 
                 stats["errors"] += 1
                 
         send_mattermost_report("comments", stats["success"], stats["skipped"], stats["errors"])
