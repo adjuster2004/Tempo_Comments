@@ -109,6 +109,14 @@ docker exec -it jira-tempo-sync python /app/get_dict_full.py
 docker compose down
 ```
 
+## Запуск без compose
+
+```bash
+docker rm -f jira-tempo-sync
+docker build -t jira-tempo-sync .
+docker run -d --name jira-tempo-sync --env-file .env --restart unless-stopped jira-tempo-sync
+```
+
 ## Файл entrypoint.sh 
 нужен для сборки Cron заданий из .env в одно целое
 
