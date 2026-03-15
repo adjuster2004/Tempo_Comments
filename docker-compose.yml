@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  jira-tempo-sync:
+    build: .
+    container_name: jira-tempo-sync
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Опционально: можно настроить часовой пояс контейнера
+    environment:
+      - TZ=Europe/Moscow
