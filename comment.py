@@ -6,33 +6,43 @@ import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Загружаем конфиг
+# Загружаем конфиг из файла .env
 load_dotenv()
 
+# --- НАСТРОЙКИ JIRA И TEMPO ---
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL", "").rstrip("/")
 JIRA_TOKEN = os.getenv("JIRA_API_TOKEN") 
 TEMPO_TOKEN = os.getenv("TEMPO_API_TOKEN") 
 
+# --- НАСТРОЙКИ MATTERMOST ---
 MATTERMOST_WEBHOOK_URL = os.getenv("MATTERMOST_WEBHOOK_URL", "")
 MATTERMOST_DEFAULT_CHANNEL = os.getenv("MATTERMOST_DEFAULT_CHANNEL", "")
 MATTERMOST_USERNAME = os.getenv("MATTERMOST_USERNAME", "Tempo_Comments")
 
-# Загружаем списки пользователей и фильтруем тех, кто с восклицательным знаком
+# --- НАСТРОЙКИ ПОЛЬЗОВАТЕЛЕЙ И КОМАНД ---
+# Загружаем списки пользователей и фильтруем тех, кто с восклицательным знаком (исключения)
 RAW_USERS = [u.strip() for u in os.getenv("TARGET_USERS", "").split(",") if u.strip()]
 TARGET_USERS = [u for u in RAW_USERS if not u.startswith("!")]
 EXCLUDED_USERS = [u.lstrip("!") for u in RAW_USERS if u.startswith("!")]
 
 TARGET_TEAMS = [t.strip() for t in os.getenv("TARGET_TEAMS", "").split(",") if t.strip()]
 
+# --- НАСТРОЙКИ ВСТРЕЧ И ВНУТРЕННЕЙ ДЕЯТЕЛЬНОСТИ ---
 MEETING_ISSUE_KEY = os.getenv("MEETING_ISSUE_KEY", "LIFE-5")
 MEETING_ACCOUNT_KEY = os.getenv("MEETING_ACCOUNT_KEY", "lo-14")
 MONDAY_EXCLUDE_USERS = [u.strip() for u in os.getenv("MONDAY_EXCLUDE_USERS", "").split(",") if u.strip()]
 
+# --- ПРОЧИЕ НАСТРОЙКИ ---
 TARGET_PROJECTS = os.getenv("TARGET_PROJECTS", "")
 AUTO_TAG = os.getenv("AUTO_TAG", "[AUTO]")
 DEFAULT_TIME_SPENT = int(os.getenv("DEFAULT_TIME_SPENT_SECONDS", 300))
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() in ("true", "1", "yes")
 
+# --- ТАЙМАУТЫ ---
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 20))
+WORKLOG_TIMEOUT = int(os.getenv("WORKLOG_TIMEOUT", 60))
+
+# --- ЗАГОЛОВКИ ДЛЯ API ---
 JIRA_HEADERS = {
     "Authorization": f"Bearer {JIRA_TOKEN}",
     "Content-Type": "application/json"
@@ -52,26 +62,32 @@ except json.JSONDecodeError:
     PRODUCT_ACCOUNT_MAP = {}
 
 def parse_time_to_seconds(time_str):
-    """Парсит человекочитаемое время в секунды (например, '1.5 часа', '30 мин', '1h 30m')."""
+    """
+    Парсит человекочитаемое время в секунды.
+    Поддерживает форматы: '1.5 часа', '30 мин', '1h 30m', '3 часа 45 минут'.
+    """
     time_str = str(time_str).lower().strip()
+    total_seconds = 0
     
-    match_decimal = re.match(r'^([\d\.,]+)\s*(час|ч|h|hour)', time_str)
-    if match_decimal:
-        val = float(match_decimal.group(1).replace(',', '.'))
-        return int(val * 3600)
-        
-    hours = 0
-    minutes = 0
-    
-    h_match = re.search(r'(\d+)\s*(час|ч|h)', time_str)
+    # Поиск часов (поддерживает и целые, и дробные числа: "1.5 ч", "3 часа")
+    h_match = re.search(r'([\d\.,]+)\s*(час|ч|h|hour)', time_str)
     if h_match:
-        hours = int(h_match.group(1))
-        
-    m_match = re.search(r'(\d+)\s*(мин|м|m)', time_str)
+        try:
+            # Меняем запятую на точку для правильного преобразования (напр. 1,5 -> 1.5)
+            hours = float(h_match.group(1).replace(',', '.'))
+            total_seconds += int(hours * 3600)
+        except ValueError:
+            pass
+            
+    # Поиск минут (например: "45 мин", "30m", "45 минут")
+    m_match = re.search(r'([\d\.,]+)\s*(мин|м|m|min)', time_str)
     if m_match:
-        minutes = int(m_match.group(1))
-        
-    total_seconds = (hours * 3600) + (minutes * 60)
+        try:
+            minutes = float(m_match.group(1).replace(',', '.'))
+            total_seconds += int(minutes * 60)
+        except ValueError:
+            pass
+            
     return total_seconds if total_seconds > 0 else None
 
 def process_comment_body(raw_body, default_product, project_key):
@@ -88,6 +104,7 @@ def process_comment_body(raw_body, default_product, project_key):
                 if line.strip():
                     cut_idx = i + 1
                     break
+            
             clean_body = '\n'.join(lines[cut_idx:]).strip()
             if not clean_body:
                 clean_body = "Ворклог"
@@ -144,6 +161,7 @@ def process_comment_body(raw_body, default_product, project_key):
     return default_product, DEFAULT_TIME_SPENT, raw_body.strip()
 
 def parse_jira_date(date_str):
+    """Парсит различные форматы дат из Jira."""
     if not date_str or str(date_str) in ['None', '']:
         return None
         
@@ -187,6 +205,7 @@ def parse_jira_date(date_str):
     return None
 
 def get_team_members():
+    """Получает список участников целевых команд из Tempo."""
     team_users = {} 
     
     if not TARGET_TEAMS:
@@ -194,65 +213,68 @@ def get_team_members():
         
     print(f"\nИщем команды в Tempo: {TARGET_TEAMS}")
     
-    teams_url = f"{JIRA_BASE_URL}/rest/tempo-teams/2/team"
-    response = requests.get(teams_url, headers=TEMPO_HEADERS)
-    
-    if response.status_code != 200:
-        print(f"🚫 Ошибка при получении списка команд. Статус: {response.status_code}")
-        return team_users
+    try:
+        teams_url = f"{JIRA_BASE_URL}/rest/tempo-teams/2/team"
+        response = requests.get(teams_url, headers=TEMPO_HEADERS, timeout=REQUEST_TIMEOUT)
         
-    all_teams = response.json()
-    target_teams_lower = [t.lower() for t in TARGET_TEAMS]
-    
-    found_team_ids = []
-    for team in all_teams:
-        if team.get("name", "").lower() in target_teams_lower:
-            found_team_ids.append((team["id"], team["name"]))
+        if response.status_code != 200:
+            print(f"🚫 Ошибка при получении списка команд. Статус: {response.status_code}")
+            return team_users
             
-    if not found_team_ids:
-        print("🤔 Указанные команды не найдены в Tempo.")
-        return team_users
+        all_teams = response.json()
+        target_teams_lower = [t.lower() for t in TARGET_TEAMS]
         
-    now = datetime.now()
-        
-    for team_id, team_name in found_team_ids:
-        print(f"Загружаем участников команды '{team_name}' (ID: {team_id})...")
-        members_url = f"{JIRA_BASE_URL}/rest/tempo-teams/2/team/{team_id}/member"
-        m_response = requests.get(members_url, headers=TEMPO_HEADERS)
-        
-        if m_response.status_code == 200:
-            members_data = m_response.json()
-            active_team_members = set() 
+        found_team_ids = []
+        for team in all_teams:
+            if team.get("name", "").lower() in target_teams_lower:
+                found_team_ids.append((team["id"], team["name"]))
+                
+        if not found_team_ids:
+            print("🤔 Указанные команды не найдены в Tempo.")
+            return team_users
             
-            for m in members_data:
-                member_name = m.get("member", {}).get("name")
-                if not member_name: 
-                    continue
+        now = datetime.now()
+            
+        for team_id, team_name in found_team_ids:
+            print(f"Загружаем участников команды '{team_name}' (ID: {team_id})...")
+            members_url = f"{JIRA_BASE_URL}/rest/tempo-teams/2/team/{team_id}/member"
+            m_response = requests.get(members_url, headers=TEMPO_HEADERS, timeout=REQUEST_TIMEOUT)
+            
+            if m_response.status_code == 200:
+                members_data = m_response.json()
+                active_team_members = set() 
+                
+                for m in members_data:
+                    member_name = m.get("member", {}).get("name")
+                    if not member_name: 
+                        continue
+                        
+                    membership = m.get("membership", {})
+                    raw_from = membership.get("dateFromANSI") or membership.get("dateFrom") or m.get("dateFrom")
+                    raw_to = membership.get("dateToANSI") or membership.get("dateTo") or m.get("dateTo")
                     
-                membership = m.get("membership", {})
-                raw_from = membership.get("dateFromANSI") or membership.get("dateFrom") or m.get("dateFrom")
-                raw_to = membership.get("dateToANSI") or membership.get("dateTo") or m.get("dateTo")
-                
-                start_dt = parse_jira_date(raw_from) if raw_from else datetime.min
-                if not start_dt: 
-                    start_dt = datetime.min
+                    start_dt = parse_jira_date(raw_from) if raw_from else datetime.min
+                    if not start_dt: 
+                        start_dt = datetime.min
+                        
+                    end_dt_parsed = parse_jira_date(raw_to) if raw_to else None
+                    end_dt = end_dt_parsed.replace(hour=23, minute=59, second=59) if end_dt_parsed else datetime.max
                     
-                end_dt_parsed = parse_jira_date(raw_to) if raw_to else None
-                end_dt = end_dt_parsed.replace(hour=23, minute=59, second=59) if end_dt_parsed else datetime.max
-                
-                if member_name not in team_users: 
-                    team_users[member_name] = []
-                team_users[member_name].append((start_dt, end_dt))
-                
-                if start_dt <= now <= end_dt:
-                    if member_name not in EXCLUDED_USERS:
-                        active_team_members.add(member_name)
-                
-            print(f"  -> Всего записей об участии: {len(members_data)}")
-            if active_team_members:
-                print(f"  -> Текущий активный состав: {', '.join(sorted(active_team_members))}") 
-        else:
-            print(f"🚫 Ошибка получения участников: {m_response.status_code}")
+                    if member_name not in team_users: 
+                        team_users[member_name] = []
+                    team_users[member_name].append((start_dt, end_dt))
+                    
+                    if start_dt <= now <= end_dt:
+                        if member_name not in EXCLUDED_USERS:
+                            active_team_members.add(member_name)
+                    
+                print(f"  -> Всего записей об участии: {len(members_data)}")
+                if active_team_members:
+                    print(f"  -> Текущий активный состав: {', '.join(sorted(active_team_members))}") 
+            else:
+                print(f"🚫 Ошибка получения участников: {m_response.status_code}")
+    except Exception as e:
+        print(f"🚫 Ошибка при загрузке команд: {e}")
             
     if team_users:
         active_overall = set()
@@ -264,6 +286,7 @@ def get_team_members():
     return team_users
 
 def is_valid_author(author, comment_time, team_users):
+    """Проверяет, является ли автор целевым пользователем."""
     if author in TARGET_USERS: 
         return True
     if author in team_users:
@@ -273,6 +296,7 @@ def is_valid_author(author, comment_time, team_users):
     return False
 
 def get_recent_jira_comments(team_users):
+    """Получает комментарии из Jira за последние 24 часа."""
     if TARGET_PROJECTS:
         projects_list = [f'"{p.strip()}"' for p in TARGET_PROJECTS.split(",") if p.strip()]
         projects_jql = ",".join(projects_list)
@@ -282,85 +306,93 @@ def get_recent_jira_comments(team_users):
         
     print(f"Выполняем JQL запрос: {jql}")
     
-    response = requests.get(
-        f"{JIRA_BASE_URL}/rest/api/2/search",
-        headers=JIRA_HEADERS,
-        params={"jql": jql, "fields": "comment,project,customfield_24604", "maxResults": 500}
-    )
-    
-    if response.status_code != 200:
-        print(f"🚫 Ошибка при поиске задач в Jira. Статус: {response.status_code}")
-        return []
+    try:
+        response = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/2/search",
+            headers=JIRA_HEADERS,
+            params={"jql": jql, "fields": "comment,project,customfield_24604", "maxResults": 500},
+            timeout=REQUEST_TIMEOUT
+        )
         
-    issues = response.json().get("issues", [])
-    print(f"Найдено задач, обновленных за сутки: {len(issues)}\n")
-    
-    recent_comments = []
-    cutoff_time = datetime.now() - timedelta(days=1)
+        if response.status_code != 200:
+            print(f"🚫 Ошибка при поиске задач в Jira. Статус: {response.status_code}")
+            return []
+            
+        issues = response.json().get("issues", [])
+        print(f"Найдено задач, обновленных за сутки: {len(issues)}\n")
+        
+        recent_comments = []
+        cutoff_time = datetime.now() - timedelta(days=1)
 
-    for issue in issues:
-        issue_key = issue["key"]
-        issue_id = issue["id"] 
-        project_key = issue.get("fields", {}).get("project", {}).get("key", "")
-        
-        product_field = issue.get("fields", {}).get("customfield_24604")
-        product_name = ""
-        
-        if isinstance(product_field, dict): 
-            product_name = product_field.get("value", product_field.get("name", ""))
-        elif isinstance(product_field, list) and product_field:
-            val = product_field[0]
-            if isinstance(val, dict):
-                product_name = val.get("value", val.get("name", ""))
-            else:
-                product_name = str(val)
-        elif isinstance(product_field, str): 
-            product_name = product_field
+        for issue in issues:
+            issue_key = issue["key"]
+            issue_id = issue["id"] 
+            project_key = issue.get("fields", {}).get("project", {}).get("key", "")
             
-        comments = issue.get("fields", {}).get("comment", {}).get("comments", [])
-        
-        for comment in comments:
-            author_name = comment["author"].get("name")
-            author_key = comment["author"].get("key") 
+            product_field = issue.get("fields", {}).get("customfield_24604")
+            product_name = ""
             
-            if not author_name: 
-                author_name = author_key or "Unknown"
-            if not author_key: 
-                author_key = author_name
+            if isinstance(product_field, dict): 
+                product_name = product_field.get("value", product_field.get("name", ""))
+            elif isinstance(product_field, list) and product_field:
+                val = product_field[0]
+                if isinstance(val, dict):
+                    product_name = val.get("value", val.get("name", ""))
+                else:
+                    product_name = str(val)
+            elif isinstance(product_field, str): 
+                product_name = product_field
                 
-            created_str = comment["created"][:19] 
-            created_time = datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%S")
-            comment_id = comment.get("id") 
+            comments = issue.get("fields", {}).get("comment", {}).get("comments", [])
             
-            if created_time > cutoff_time and is_valid_author(author_name, created_time, team_users):
-                print(f"[LOG] Найдена цель: {author_name} оставил комментарий (CID:{comment_id}) в {issue_key}")
-                recent_comments.append({
-                    "comment_id": comment_id,
-                    "issue_key": issue_key,
-                    "issue_id": issue_id,
-                    "project_key": project_key,
-                    "product_name": product_name,
-                    "author_name": author_name, 
-                    "author_key": author_key,   
-                    "body": comment["body"],
-                    "created": created_time
-                })
+            for comment in comments:
+                author_name = comment["author"].get("name")
+                author_key = comment["author"].get("key") 
                 
-    return recent_comments
+                if not author_name: 
+                    author_name = author_key or "Unknown"
+                if not author_key: 
+                    author_key = author_name
+                    
+                created_str = comment["created"][:19] 
+                created_time = datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%S")
+                comment_id = comment.get("id") 
+                
+                if created_time > cutoff_time and is_valid_author(author_name, created_time, team_users):
+                    print(f"[LOG] Найдена цель: {author_name} оставил комментарий (CID:{comment_id}) в {issue_key}")
+                    recent_comments.append({
+                        "comment_id": comment_id,
+                        "issue_key": issue_key,
+                        "issue_id": issue_id,
+                        "project_key": project_key,
+                        "product_name": product_name,
+                        "author_name": author_name, 
+                        "author_key": author_key,   
+                        "body": comment["body"],
+                        "created": created_time
+                    })
+                    
+        return recent_comments
+    except Exception as e:
+        print(f"🚫 Ошибка при поиске комментариев: {e}")
+        return []
 
 def filter_and_group_comments(comments):
     """Отфильтровывает уже обработанные комментарии и склеивает оставшиеся."""
     issue_worklogs = {}
     
-    # Загружаем базу существующих ворклогов для проверки
     for c in comments:
         issue_key = c['issue_key']
         if issue_key not in issue_worklogs:
-            url = f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog"
-            resp = requests.get(url, headers=JIRA_HEADERS)
-            if resp.status_code == 200:
-                issue_worklogs[issue_key] = resp.json().get("worklogs", [])
-            else:
+            try:
+                url = f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog"
+                resp = requests.get(url, headers=JIRA_HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    issue_worklogs[issue_key] = resp.json().get("worklogs", [])
+                else:
+                    issue_worklogs[issue_key] = []
+            except Exception as e:
+                print(f"⚠️ Ошибка при получении ворклогов для {issue_key}: {e}")
                 issue_worklogs[issue_key] = []
             
     unprocessed = []
@@ -375,19 +407,16 @@ def filter_and_group_comments(comments):
             desc = str(wl.get("comment", ""))
             start_date = wl.get("started", "")[:10]
             
-            # Проверка 1: Строго по ID комментария (надежно)
             if marker in desc:
                 is_processed = True
                 break
                 
-            # Проверка 2: Обратная совместимость (если ворклог был создан до введения CID)
             if start_date == date_str and AUTO_TAG in desc and "CID:" not in desc:
                 if c['body'][:30].strip() in desc:
                     is_processed = True
                     break
                 
         if not is_processed:
-            # Парсим продукт ПЕРЕД группировкой, чтобы знать, склеивать их или нет
             final_product, final_time, clean_body = process_comment_body(
                 c['body'], c.get('product_name'), c.get('project_key')
             )
@@ -401,7 +430,6 @@ def filter_and_group_comments(comments):
             
     grouped = {}
     for c in unprocessed:
-        # Уникальный ключ группы. Если продукты разные - комментарии склеены не будут!
         group_key = (c['issue_key'], c['author_key'], c['date_str'], c['final_product'])
         
         if group_key not in grouped:
@@ -426,26 +454,44 @@ def filter_and_group_comments(comments):
 def create_tempo_worklog(agg_data):
     """Создает ворклог на основе сгруппированных данных."""
     cids_str = ",".join(agg_data['comment_ids'])
+    date_str = agg_data['created'].strftime("%Y-%m-%d")
     
-    # Отдельная защита от дублей для авто-встреч
     if 'MEET-' in cids_str:
-        issue_key = agg_data['issue_key']
-        resp = requests.get(f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/worklog", headers=JIRA_HEADERS)
-        if resp.status_code == 200:
-            for wl in resp.json().get("worklogs", []):
-                if cids_str in str(wl.get("comment", "")):
-                    print(f"🤔 Ворклог для встречи ({cids_str}) пользователя {agg_data['author_name']} уже существует. Пропускаем.")
-                    return "skipped", None
+        worker_key = agg_data['author_key']
+        try:
+            url = f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs?username={worker_key}&dateFrom={date_str}&dateTo={date_str}"
+            resp = requests.get(url, headers=TEMPO_HEADERS, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                for wl in resp.json():
+                    if cids_str in str(wl.get("comment", "")) and str(wl.get("originTaskId")) == str(agg_data['issue_id']):
+                        print(f"🤔 Ворклог для встречи ({cids_str}) пользователя {agg_data['author_name']} уже существует. Пропускаем.")
+                        return "skipped", None
+        except Exception as e:
+            print(f"⚠️ Ошибка проверки дублей для встречи: {e}")
 
     final_product = agg_data['final_product']
     total_time_spent = agg_data['total_time']
     
-    # Формируем тело с границами между разными комментариями
+    # --- НОВАЯ ЗАЩИТА ОТ "КРИВЫХ РУК" (МАКСИМУМ 24 ЧАСА В ДЕНЬ) ---
+    MAX_SECONDS_PER_DAY = 86400
+    
+    # Узнаем, сколько часов уже залогировано у пользователя за этот день в Jira
+    already_logged = check_user_daily_hours(agg_data['author_key'], date_str)
+    
+    if already_logged + total_time_spent > MAX_SECONDS_PER_DAY:
+        allowed_time = MAX_SECONDS_PER_DAY - already_logged
+        if allowed_time <= 0:
+            print(f"🚫 Ошибка лимита: У {agg_data['author_name']} уже залогировано 24+ часа за {date_str}. Пропускаем ворклог.")
+            return "skipped", None
+        else:
+            print(f"⚠️ ВНИМАНИЕ: {agg_data['author_name']} превысил лимит в 24ч! Урезаем запрашиваемое время с {total_time_spent} до {allowed_time} сек.")
+            total_time_spent = allowed_time
+    # ---------------------------------------------------------------
+    
     combined_body = "\n---\n".join(agg_data['bodies'])
     if len(combined_body) > 250:
         combined_body = combined_body[:250] + "..."
         
-    # НОВОЕ: Перенесли CID в самый конец, чтобы он не засорял интерфейс
     description = f"{AUTO_TAG} {combined_body}\n\n(CID:{cids_str})"
     started_str = agg_data['created'].strftime("%Y-%m-%dT%H:%M:%S.000")
     
@@ -462,7 +508,6 @@ def create_tempo_worklog(agg_data):
     if final_product: 
         account_key = PRODUCT_ACCOUNT_MAP.get(final_product) 
         
-    # Если аккаунт не найден, а задача в INT — ставим MEETING_ACCOUNT_KEY
     if not account_key and agg_data.get("project_key") == "INT": 
         account_key = MEETING_ACCOUNT_KEY
         
@@ -482,13 +527,22 @@ def create_tempo_worklog(agg_data):
     if DEBUG_MODE:
         return "success", f"{agg_data['author_name']} -> {agg_data['issue_key']} ({round(total_time_spent/60)}м) [DEBUG]"
 
-    response = requests.post(f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs", headers=TEMPO_HEADERS, json=payload)
-    
-    if response.status_code in (200, 201):
-        print(f"✅ Ворклог успешно создан!")
-        return "success", f"{agg_data['author_name']} -> {agg_data['issue_key']} ({round(total_time_spent/60)}м)"
-    else:
-        print(f"🚫 Ошибка создания ворклога: {response.text}")
+    try:
+        response = requests.post(
+            f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs", 
+            headers=TEMPO_HEADERS, 
+            json=payload, 
+            timeout=WORKLOG_TIMEOUT
+        )
+        
+        if response.status_code in (200, 201):
+            print(f"✅ Ворклог успешно создан!")
+            return "success", f"{agg_data['author_name']} -> {agg_data['issue_key']} ({round(total_time_spent/60)}м)"
+        else:
+            print(f"🚫 Ошибка создания ворклога: {response.text}")
+            return "error", None
+    except Exception as e:
+        print(f"🚫 Ошибка соединения при создании ворклога: {e}")
         return "error", None
 
 def send_mattermost_report(mode, success_list, skipped, errors):
@@ -523,30 +577,56 @@ def send_mattermost_report(mode, success_list, skipped, errors):
         payload["username"] = MATTERMOST_USERNAME
         
     try: 
-        requests.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=10)
+        requests.post(MATTERMOST_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
     except Exception as e: 
         print(f"🚫 Ошибка Mattermost: {e}")
 
 def check_user_daily_hours(worker_key, date_str):
     """Считает общую сумму залогированных часов за день."""
-    url = f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs?username={worker_key}&dateFrom={date_str}&dateTo={date_str}"
-    response = requests.get(url, headers=TEMPO_HEADERS)
-    total_seconds = 0
-    if response.status_code == 200:
-        for wl in response.json():
-            total_seconds += wl.get("timeSpentSeconds", 0)
-    return total_seconds
+    try:
+        url = f"{JIRA_BASE_URL}/rest/tempo-timesheets/4/worklogs?username={worker_key}&dateFrom={date_str}&dateTo={date_str}"
+        response = requests.get(url, headers=TEMPO_HEADERS, timeout=REQUEST_TIMEOUT)
+        total_seconds = 0
+        if response.status_code == 200:
+            for wl in response.json():
+                total_seconds += wl.get("timeSpentSeconds", 0)
+        return total_seconds
+    except Exception as e:
+        print(f"⚠️ Ошибка при проверке часов пользователя {worker_key}: {e}")
+        return 0
+
+USER_KEY_CACHE = {}
+
+def get_jira_user_key(username):
+    """Преобразует имя пользователя в уникальный userKey Jira (Tempo требует именно его)."""
+    if username in USER_KEY_CACHE:
+        return USER_KEY_CACHE[username]
+    try:
+        res = requests.get(f"{JIRA_BASE_URL}/rest/api/2/user?username={username}", headers=JIRA_HEADERS, timeout=REQUEST_TIMEOUT)
+        if res.status_code == 200:
+            user_key = res.json().get("key", username)
+            USER_KEY_CACHE[username] = user_key
+            return user_key
+    except Exception:
+        pass
+    USER_KEY_CACHE[username] = username
+    return username
 
 def process_daily_meetings():
+    """Автоматически создает ворклоги по ежедневным встречам."""
     print("\n--- ЗАПУСК АВТОМАТИЗАЦИИ ЕЖЕДНЕВНЫХ ВСТРЕЧ ---")
     
     meeting_issue_id = "UNKNOWN"
-    res = requests.get(f"{JIRA_BASE_URL}/rest/api/2/issue/{MEETING_ISSUE_KEY}?fields=id", headers=JIRA_HEADERS)
-    if res.status_code == 200: 
-        meeting_issue_id = res.json().get("id")
-    else: 
-        print("🚫 Ошибка: не удалось получить ID задачи для встреч.")
-        return 
+    try:
+        res = requests.get(f"{JIRA_BASE_URL}/rest/api/2/issue/{MEETING_ISSUE_KEY}?fields=id", headers=JIRA_HEADERS, timeout=REQUEST_TIMEOUT)
+        if res.status_code == 200: 
+            meeting_issue_id = res.json().get("id")
+        else: 
+            print(f"🚫 Ошибка: не удалось получить ID задачи {MEETING_ISSUE_KEY}. Статус: {res.status_code}")
+            return 
+    except Exception as e:
+        print(f"🚫 Ошибка соединения с Jira при поиске задачи встреч: {e}")
+        return
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     is_monday = datetime.now().weekday() == 0
@@ -564,27 +644,28 @@ def process_daily_meetings():
             stats["skipped"] += 1
             continue
             
+        real_user_key = get_jira_user_key(user)
+            
         if is_monday:
             if user in MONDAY_EXCLUDE_USERS:
                 stats["skipped"] += 1
                 continue
                 
-            total_hours_today = check_user_daily_hours(user, today_str)
+            total_hours_today = check_user_daily_hours(real_user_key, today_str)
             if total_hours_today >= 28800:
                 stats["skipped"] += 1
                 continue
 
-        # Создаем фейковые сгруппированные данные для совместимости с новой функцией
         fake_agg_data = {
             'comment_ids': [f"MEET-{today_str}"], 
             'issue_key': MEETING_ISSUE_KEY,
             'issue_id': meeting_issue_id, 
             'project_key': 'LIFE',
-            'author_key': user,
+            'author_key': real_user_key,
             'author_name': user,
             'created': datetime.now(),
             'final_product': MEETING_ACCOUNT_KEY,
-            'total_time': 1800, # 30 минут
+            'total_time': 1800, 
             'bodies': ["Встреча внутренняя"]
         }
         
@@ -600,6 +681,7 @@ def process_daily_meetings():
     send_mattermost_report("meetings", stats["success"], stats["skipped"], stats["errors"])
 
 def main():
+    """Точка входа."""
     if len(sys.argv) > 1 and sys.argv[1] == "--meetings":
         process_daily_meetings()
     else:
@@ -612,7 +694,6 @@ def main():
             print("\nНовых комментариев не найдено.")
             return 
         
-        # Запускаем фильтрацию и склейку
         aggregated_tasks = filter_and_group_comments(comments)
         
         if not aggregated_tasks:
